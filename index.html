@@ -1,0 +1,429 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Generador de diálogos en chino</title>
+<style>
+  :root { color-scheme: light dark; }
+  body { font-family: system-ui, sans-serif; max-width: 640px; margin: 0 auto; padding: 24px 16px 60px; }
+  h1 { font-size: 20px; margin: 0 0 4px; }
+  p.sub { margin: 0 0 12px; font-size: 14px; opacity: .7; }
+  label { display: block; font-size: 13px; opacity: .7; margin: 14px 0 4px; }
+  label.chk { display: flex; gap: 8px; align-items: center; margin-top: 8px; }
+  textarea, select, button, input[type=number], input[type=text] { width: 100%; box-sizing: border-box; font-size: 16px; padding: 10px; border-radius: 8px; border: 1px solid #8884; background: transparent; color: inherit; }
+  input[type=checkbox] { width: auto; }
+  textarea { min-height: 190px; font-size: 20px; resize: vertical; }
+  button { cursor: pointer; font-weight: 600; background: #6d4aff; color: #fff; border: none; margin-top: 12px; }
+  button.sec { background: #8883; color: inherit; }
+  button:disabled { opacity: .45; cursor: not-allowed; }
+  .row { display: flex; gap: 8px; }
+  .row > * { flex: 1; }
+  .spk { display: flex; gap: 8px; align-items: center; margin-top: 8px; }
+  .spk b { min-width: 92px; font-size: 14px; }
+  .spk select { flex: 1; }
+  .spk button { width: auto; margin: 0; padding: 10px 14px; }
+  #resumen { margin-top: 8px; font-size: 13px; opacity: .75; }
+  .bar { height: 10px; border-radius: 6px; background: #8883; overflow: hidden; margin-top: 16px; }
+  .bar > div { height: 100%; width: 0; background: #6d4aff; transition: width .2s; }
+  #count { margin-top: 8px; font-size: 14px; }
+  #log { margin-top: 10px; font-size: 13px; font-family: ui-monospace, monospace; max-height: 260px; overflow: auto; background: #8881; border-radius: 8px; padding: 8px 10px; white-space: pre-wrap; }
+  .err { color: #d33; }
+  #result { display: none; margin-top: 16px; }
+  #player { width: 100%; }
+  a.dl { display: block; text-align: center; text-decoration: none; font-weight: 600; background: #6d4aff; color: #fff; border-radius: 8px; padding: 12px; margin-top: 10px; }
+  small { opacity: .6; display: block; margin-top: 16px; line-height: 1.4; }
+</style>
+</head>
+<body>
+<h1>🎭 Generador de diálogos en chino</h1>
+<p class="sub">Una intervención por línea, empezando por <b>男</b> o <b>女</b> → un solo mp3 con voces distintas.</p>
+
+<label for="texto">Diálogo</label>
+<textarea id="texto" placeholder="男：你好，请问现在几点？&#10;女：现在三点半。&#10;男：谢谢！"></textarea>
+<div id="resumen"></div>
+
+<label for="archivo">…o carga un archivo .txt</label>
+<input type="file" id="archivo" accept=".txt">
+
+<div class="row">
+  <div>
+    <label for="proveedor">Sintetizador</label>
+    <select id="proveedor">
+      <option value="elevenlabs">ElevenLabs</option>
+      <option value="gemini">Google Gemini</option>
+      <option value="openai">OpenAI</option>
+      <option value="aws-polly">Amazon Polly (neural)</option>
+    </select>
+  </div>
+</div>
+
+<label>Voz de cada personaje (según el 男 / 女 del texto)</label>
+<div id="speakers"></div>
+<label class="chk"><input type="checkbox" id="sinclas"> Incluir también voces sin clasificar (género no confirmado)</label>
+
+<div class="row">
+  <div>
+    <label for="pausa">Pausa entre intervenciones (s)</label>
+    <input type="number" id="pausa" min="0" max="5" step="0.1" value="0.6">
+  </div>
+  <div>
+    <label for="nombre">Nombre del archivo</label>
+    <input type="text" id="nombre" value="dialogo">
+  </div>
+</div>
+
+<div class="row">
+  <button id="btnStart">▶ Generar diálogo</button>
+  <button id="btnStop" class="sec" disabled>■ Detener</button>
+</div>
+
+<div class="bar"><div id="barFill"></div></div>
+<div id="count"></div>
+<div id="log"></div>
+
+<div id="result">
+  <audio id="player" controls></audio>
+  <a id="dl" class="dl" download>⬇ Descargar</a>
+</div>
+
+<small>
+  Cada línea que empiece por 男 o 女 es una intervención. Si hay varios hombres o mujeres, numéralos (男1, 男2, 女1…): cada uno tendrá su propia voz.
+  Admite «男：», «男:», «【男】» o «男 » seguido del texto. Una línea sin marca se une a la intervención anterior.
+  Las frases ya generadas se guardan en memoria mientras no recargues la página, así que si algo falla, al repetir solo se vuelve a pedir lo que faltaba.
+  Debe abrirse desde una dirección web (https), no con doble clic en el archivo.
+</small>
+
+<script>
+const $ = (id) => document.getElementById(id);
+const sleep = (ms) => new Promise(r => setTimeout(r, ms));
+
+const PUTER_MSG = "No se pudo cargar Puter.js. Abre esta página desde una dirección web (https) y sin bloqueadores activos.";
+const puterReady = new Promise((resolve) => {
+  if (window.puter) return resolve(true);
+  const sc = document.createElement("script");
+  sc.src = "https://js.puter.com/v2/";
+  sc.onload = () => resolve(!!window.puter);
+  sc.onerror = () => resolve(false);
+  document.head.appendChild(sc);
+});
+
+function log(msg, err) {
+  const d = document.createElement("div");
+  if (err) d.className = "err";
+  d.textContent = msg;
+  $("log").appendChild(d);
+  $("log").scrollTop = $("log").scrollHeight;
+}
+
+/* ---------- Género de las voces ----------
+   Se usa el género que devuelva Puter si lo incluye; si no, esta tabla (por nombre).
+   Lo que no esté aquí queda «sin clasificar». Comprueba cada voz con el botón 🔊. */
+const GENDER = {
+  // Gemini
+  zephyr:"f", kore:"f", leda:"f", aoede:"f", callirrhoe:"f", autonoe:"f", despina:"f", erinome:"f", laomedeia:"f",
+  achernar:"f", gacrux:"f", pulcherrima:"f", vindemiatrix:"f", sulafat:"f",
+  puck:"m", charon:"m", fenrir:"m", orus:"m", enceladus:"m", iapetus:"m", umbriel:"m", algieba:"m", algenib:"m",
+  rasalgethi:"m", alnilam:"m", schedar:"m", achird:"m", zubenelgenubi:"m", sadachbia:"m", sadaltager:"m",
+  // OpenAI
+  nova:"f", shimmer:"f", coral:"f", sage:"f", onyx:"m", echo:"m", fable:"m", ash:"m",
+  // Amazon Polly
+  zhiyu:"f",
+  // ElevenLabs
+  rachel:"f", bella:"f", domi:"f", elli:"f", adam:"m", antoni:"m", josh:"m", sam:"m", arnold:"m"
+};
+function genderOf(v) {
+  const raw = String(v.gender || (v.labels && (v.labels.gender || v.labels.Gender)) || (v.meta && v.meta.gender) || (v.attributes && v.attributes.gender) || "").toLowerCase();
+  if (/^(f|mujer|femen)/.test(raw)) return "f";
+  if (/^(m|hombre|mascul)/.test(raw)) return "m";
+  const nm = String(v.name || v.id || "").toLowerCase().split(/[\s(–-]/)[0];
+  return GENDER[nm] || GENDER[String(v.id || "").toLowerCase()] || null;
+}
+
+const FALLBACK_VOICES = {
+  elevenlabs: [["21m00Tcm4TlvDq8ikWAM","Rachel"],["EXAVITQu4vr4xnSDxMaL","Bella"],["pNInz6obpgDQGcFmaJgB","Adam"],["TxGEqnHWrfWFTfGW9XjX","Josh"],["ErXwobaYiN019PkySvjV","Antoni"]],
+  gemini: [["Kore","Kore"],["Aoede","Aoede"],["Leda","Leda"],["Zephyr","Zephyr"],["Puck","Puck"],["Charon","Charon"],["Fenrir","Fenrir"],["Orus","Orus"]],
+  openai: [["nova","Nova"],["shimmer","Shimmer"],["coral","Coral"],["sage","Sage"],["onyx","Onyx"],["echo","Echo"],["fable","Fable"],["ash","Ash"],["alloy","Alloy"]],
+  "aws-polly": [["Zhiyu","Zhiyu"]]
+};
+
+let VOICES = [];          // [{id, name, g}]
+const chosen = {};        // clave de personaje -> id de voz elegida
+
+async function loadVoices() {
+  const p = $("proveedor").value;
+  VOICES = FALLBACK_VOICES[p].map(([id, name]) => ({ id, name, g: genderOf({ id, name }) }));
+  renderSpeakers();
+  if (!(await puterReady)) return;
+  try {
+    const all = await puter.ai.txt2speech.listVoices({ provider: p });
+    let vs = all.filter(v => v.language && /^(zh|cmn)/i.test(v.language.code));
+    if (!vs.length) vs = all;
+    if (vs.length && $("proveedor").value === p) {
+      VOICES = vs.slice(0, 100).map(v => ({ id: v.id, name: v.name || v.id, g: genderOf(v) }));
+      renderSpeakers();
+    }
+  } catch (e) { /* se queda la lista de respaldo */ }
+}
+
+function optionsFor(p, voice) {
+  switch (p) {
+    case "elevenlabs": return { provider: "elevenlabs", model: "eleven_multilingual_v2", voice };
+    case "gemini":     return { provider: "gemini", voice, language: "zh-CN" };
+    case "openai":     return { provider: "openai", model: "gpt-4o-mini-tts", voice,
+                                instructions: "Habla en chino mandarín estándar con acento de Pekín, tono natural, tonos claros y bien marcados, ritmo pausado, como en una conversación real." };
+    case "aws-polly":  return { provider: "aws-polly", voice: voice || "Zhiyu", engine: "neural", language: "cmn-CN" };
+  }
+}
+
+/* ---------- Análisis del diálogo ---------- */
+const TAG = /^\s*[\[【(（]?\s*(男|女)\s*([0-9０-９]{0,2})\s*[\]】)）]?\s*[:：]?\s*/;
+function parseDialogue(text) {
+  const turns = [], speakers = [], warnings = [];
+  text.split(/\r?\n/).forEach((line, n) => {
+    if (!line.trim()) return;
+    const m = line.match(TAG);
+    if (m) {
+      const id = m[2].replace(/[０-９]/g, c => String.fromCharCode(c.charCodeAt(0) - 0xFEE0));
+      const key = m[1] + id, body = line.slice(m[0].length).trim();
+      if (!body) { warnings.push(`Línea ${n + 1}: «${key}» sin texto, se ignora.`); return; }
+      if (!speakers.some(s => s.key === key)) speakers.push({ key, g: m[1] === "男" ? "m" : "f" });
+      turns.push({ spk: key, text: body });
+    } else if (turns.length) {
+      turns[turns.length - 1].text += " " + line.trim();
+    } else {
+      warnings.push(`Línea ${n + 1}: aparece antes de la primera marca 男/女, se ignora.`);
+    }
+  });
+  return { turns, speakers, warnings };
+}
+
+function renderSpeakers() {
+  const { turns, speakers, warnings } = parseDialogue($("texto").value);
+  const box = $("speakers");
+  box.querySelectorAll("select").forEach(s => { if (s.value) chosen[s.dataset.key] = s.value; });
+  box.innerHTML = "";
+  const count = { m: 0, f: 0 };
+  speakers.forEach(sp => {
+    const row = document.createElement("div"); row.className = "spk";
+    const b = document.createElement("b"); b.textContent = sp.key + (sp.g === "m" ? " · hombre" : " · mujer");
+    const sel = document.createElement("select"); sel.dataset.key = sp.key;
+    const ok = VOICES.filter(v => v.g === sp.g);
+    const unk = $("sinclas").checked ? VOICES.filter(v => !v.g) : [];
+    const add = (list, parent) => list.forEach(v => {
+      const o = document.createElement("option"); o.value = v.id; o.textContent = v.name; parent.appendChild(o);
+    });
+    if (!ok.length && !unk.length) {
+      const o = document.createElement("option");
+      o.textContent = "No hay voces " + (sp.g === "m" ? "masculinas" : "femeninas") + " clasificadas";
+      sel.appendChild(o); sel.disabled = true;
+    } else {
+      add(ok, sel);
+      if (unk.length) { const g = document.createElement("optgroup"); g.label = "Sin clasificar (género no confirmado)"; add(unk, g); sel.appendChild(g); }
+      const all = [...ok, ...unk], i = count[sp.g]++;
+      sel.value = all.some(v => v.id === chosen[sp.key]) ? chosen[sp.key] : all[i % all.length].id;
+    }
+    const pv = document.createElement("button"); pv.className = "sec"; pv.textContent = "🔊"; pv.title = "Probar esta voz";
+    pv.disabled = sel.disabled; pv.onclick = () => previewVoice(sel.value, pv);
+    row.append(b, sel, pv); box.appendChild(row);
+  });
+  const names = speakers.map(s => s.key).join(", ");
+  $("resumen").textContent = turns.length
+    ? `${turns.length} intervenciones · personajes: ${names}` + (warnings.length ? " · " + warnings.join(" ") : "")
+    : (warnings.join(" ") || "");
+}
+
+async function previewVoice(voice, btn) {
+  if (!(await puterReady)) return log(PUTER_MSG, true);
+  btn.disabled = true;
+  try {
+    const audio = await puter.ai.txt2speech("你好，很高兴认识你。", optionsFor($("proveedor").value, voice));
+    if (audio) audio.play();
+  } catch (e) { log("✗ Error en la vista previa: " + errText(e), true); }
+  btn.disabled = false;
+}
+
+$("texto").addEventListener("input", renderSpeakers);
+$("sinclas").onchange = renderSpeakers;
+$("proveedor").onchange = loadVoices;
+$("archivo").addEventListener("change", async (e) => {
+  const f = e.target.files[0]; if (!f) return;
+  $("texto").value = await f.text();
+  if (!$("nombre").value || $("nombre").value === "dialogo") $("nombre").value = f.name.replace(/\.[^.]+$/, "");
+  renderSpeakers();
+  log("Cargado " + f.name + ".");
+});
+loadVoices();
+
+/* ---------- Síntesis ---------- */
+const QUOTA_RE = /quota|insufficient|balance|limit|credit|429|payment|funds/i;
+function errText(e) {
+  return (e && (e.message || e.error?.message || e.error || (typeof e === "string" ? e : JSON.stringify(e)))) || "error desconocido";
+}
+const cache = new Map();   // "proveedor|voz|texto" -> blob
+async function synth(text, p, voice) {
+  const audio = await puter.ai.txt2speech(text, optionsFor(p, voice));
+  const src = audio && audio.src;
+  if (!src) throw new Error("Puter no devolvió una fuente de audio descargable.");
+  const blob = await (await fetch(src)).blob();
+  if (!blob.size) throw new Error("Audio vacío.");
+  return blob;
+}
+
+/* ---------- Unir y codificar en un solo mp3 ---------- */
+const LAME_SR = [8000, 11025, 12000, 16000, 22050, 24000, 32000, 44100, 48000];
+function loadLame() {
+  if (window.lamejs) return Promise.resolve(true);
+  const urls = ["https://cdnjs.cloudflare.com/ajax/libs/lamejs/1.2.1/lame.min.js", "https://cdn.jsdelivr.net/npm/lamejs@1.2.1/lame.min.js"];
+  return new Promise(res => {
+    let i = 0;
+    const next = () => {
+      if (i >= urls.length) return res(false);
+      const s = document.createElement("script"); s.src = urls[i++];
+      s.onload = () => window.lamejs ? res(true) : next();
+      s.onerror = next;
+      document.head.appendChild(s);
+    };
+    next();
+  });
+}
+function toMono(ab) {
+  if (ab.numberOfChannels === 1) return ab.getChannelData(0);
+  const n = ab.length, out = new Float32Array(n), ch = ab.numberOfChannels;
+  for (let c = 0; c < ch; c++) { const d = ab.getChannelData(c); for (let i = 0; i < n; i++) out[i] += d[i] / ch; }
+  return out;
+}
+function levelize(f) {            // iguala el volumen entre voces (RMS objetivo, con límite de pico)
+  let sum = 0, peak = 0;
+  for (let i = 0; i < f.length; i++) { const a = Math.abs(f[i]); sum += a * a; if (a > peak) peak = a; }
+  const rms = Math.sqrt(sum / f.length);
+  if (!rms || !peak) return f;
+  const g = Math.min(0.12 / rms, 0.95 / peak), out = new Float32Array(f.length);
+  for (let i = 0; i < f.length; i++) out[i] = f[i] * g;
+  return out;
+}
+function resample(f, from, to) {
+  if (from === to) return f;
+  const n = Math.round(f.length * to / from), out = new Float32Array(n), k = from / to;
+  for (let i = 0; i < n; i++) {
+    const x = i * k, i0 = Math.floor(x), i1 = Math.min(i0 + 1, f.length - 1), t = x - i0;
+    out[i] = f[i0] * (1 - t) + f[i1] * t;
+  }
+  return out;
+}
+const toInt16 = (f) => { const o = new Int16Array(f.length); for (let i = 0; i < f.length; i++) { const s = Math.max(-1, Math.min(1, f[i])); o[i] = s < 0 ? s * 0x8000 : s * 0x7fff; } return o; };
+function wavBlob(pcm, sr) {
+  const n = pcm.length, buf = new ArrayBuffer(44 + n * 2), v = new DataView(buf);
+  const w = (o, s) => [...s].forEach((c, i) => v.setUint8(o + i, c.charCodeAt(0)));
+  w(0, "RIFF"); v.setUint32(4, 36 + n * 2, true); w(8, "WAVEfmt "); v.setUint32(16, 16, true); v.setUint16(20, 1, true);
+  v.setUint16(22, 1, true); v.setUint32(24, sr, true); v.setUint32(28, sr * 2, true); v.setUint16(32, 2, true); v.setUint16(34, 16, true);
+  w(36, "data"); v.setUint32(40, n * 2, true);
+  for (let i = 0; i < n; i++) v.setInt16(44 + i * 2, pcm[i], true);
+  return new Blob([buf], { type: "audio/wav" });
+}
+
+async function buildAudio(blobs, pauseSec) {
+  const AC = window.AudioContext || window.webkitAudioContext;
+  let ctx; try { ctx = new AC({ sampleRate: 44100 }); } catch (e) { ctx = new AC(); }
+  const sr0 = ctx.sampleRate, parts = [];
+  for (const b of blobs) {
+    const ab = await ctx.decodeAudioData(await b.arrayBuffer());
+    parts.push(levelize(toMono(ab)));
+  }
+  ctx.close && ctx.close();
+  const gap = Math.round(pauseSec * sr0);
+  const total = parts.reduce((a, p) => a + p.length, 0) + gap * (parts.length - 1);
+  let all = new Float32Array(total), pos = 0;
+  parts.forEach((p, i) => { all.set(p, pos); pos += p.length + (i < parts.length - 1 ? gap : 0); });
+  let sr = sr0;
+  if (!LAME_SR.includes(sr)) { all = resample(all, sr, 44100); sr = 44100; }
+  const pcm = toInt16(all);
+
+  if (!(await loadLame())) {
+    log("No pude cargar el codificador MP3; se genera un archivo WAV (sin comprimir).", true);
+    return { blob: wavBlob(pcm, sr), ext: "wav" };
+  }
+  const enc = new lamejs.Mp3Encoder(1, sr, 96), out = [];
+  for (let i = 0, k = 0; i < pcm.length; i += 1152, k++) {
+    const b = enc.encodeBuffer(pcm.subarray(i, i + 1152));
+    if (b.length) out.push(new Uint8Array(b));
+    if (k % 200 === 0) await sleep(0);       // deja respirar a la página
+  }
+  const end = enc.flush(); if (end.length) out.push(new Uint8Array(end));
+  return { blob: new Blob(out, { type: "audio/mpeg" }), ext: "mp3" };
+}
+
+/* ---------- Proceso principal ---------- */
+let stopFlag = false, running = false, lastUrl = null;
+const safeName = (w) => (w.replace(/[\\/:*?"<>|\r\n\t]/g, "_").replace(/[. ]+$/g, "").slice(0, 100)) || "dialogo";
+
+$("btnStart").onclick = async () => {
+  if (running) return;
+  const { turns, speakers } = parseDialogue($("texto").value);
+  if (!turns.length) return log("No hay intervenciones. Empieza cada línea con 男 o 女.", true);
+  const voiceOf = {};
+  for (const sp of speakers) {
+    const sel = [...$("speakers").querySelectorAll("select")].find(s => s.dataset.key === sp.key);
+    if (!sel || sel.disabled || !sel.value) return log(`No hay voz ${sp.g === "m" ? "masculina" : "femenina"} para «${sp.key}». Prueba otro sintetizador o marca «incluir voces sin clasificar».`, true);
+    voiceOf[sp.key] = sel.value;
+  }
+  if (!(await puterReady)) return log(PUTER_MSG, true);
+
+  const p = $("proveedor").value, pause = Math.max(0, parseFloat($("pausa").value) || 0);
+  running = true; stopFlag = false;
+  $("btnStart").disabled = true; $("btnStop").disabled = false; $("result").style.display = "none";
+  const results = new Array(turns.length);
+  let done = 0, failed = 0, idx = 0;
+  const update = () => {
+    $("barFill").style.width = (100 * (done + failed) / turns.length) + "%";
+    $("count").textContent = `${done} generadas · ${failed} con error · ${turns.length} intervenciones`;
+  };
+  update();
+
+  async function worker() {
+    while (!stopFlag) {
+      const i = idx++;
+      if (i >= turns.length) return;
+      const it = turns[i], key = `${p}|${voiceOf[it.spk]}|${it.text}`;
+      if (cache.has(key)) { results[i] = cache.get(key); done++; update(); continue; }
+      let ok = false, lastErr = "";
+      for (let attempt = 1; attempt <= 3 && !stopFlag; attempt++) {
+        try {
+          const blob = await synth(it.text, p, voiceOf[it.spk]);
+          cache.set(key, blob); results[i] = blob; ok = true; break;
+        } catch (e) {
+          lastErr = errText(e);
+          if (QUOTA_RE.test(lastErr)) { stopFlag = true; log("⚠ Parece que se agotó la cuota o hay un límite: " + lastErr + ". Detenido. Lo ya generado queda en memoria: al repetir solo se pedirá lo que falta.", true); break; }
+          await sleep(800 * attempt);
+        }
+      }
+      if (ok) { done++; log(`✓ ${i + 1}/${turns.length} ${it.spk}: ${it.text.slice(0, 24)}${it.text.length > 24 ? "…" : ""}`); }
+      else { failed++; if (!stopFlag) log(`✗ ${i + 1} (${it.spk}) — ${lastErr}`, true); }
+      update();
+      await sleep(250);
+    }
+  }
+  await Promise.all([worker(), worker()]);
+
+  if (stopFlag || failed) {
+    log(stopFlag ? "Detenido. No se ha generado el archivo final." : `Hubo ${failed} intervención(es) con error: no se genera el archivo. Vuelve a pulsar «Generar»: solo se repetirán las que faltan.`, true);
+  } else {
+    log("Uniendo las voces y codificando el archivo…");
+    try {
+      const { blob, ext } = await buildAudio(results, pause);
+      if (lastUrl) URL.revokeObjectURL(lastUrl);
+      lastUrl = URL.createObjectURL(blob);
+      $("player").src = lastUrl;
+      $("dl").href = lastUrl; $("dl").download = safeName($("nombre").value) + "." + ext;
+      $("dl").textContent = `⬇ Descargar ${safeName($("nombre").value)}.${ext} (${(blob.size / 1024 / 1024).toFixed(2)} MB)`;
+      $("result").style.display = "block";
+      log("Listo: " + safeName($("nombre").value) + "." + ext);
+    } catch (e) { log("✗ No se pudo unir el audio: " + errText(e), true); }
+  }
+  running = false;
+  $("btnStart").disabled = false; $("btnStop").disabled = true;
+};
+$("btnStop").onclick = () => { stopFlag = true; log("Deteniendo…"); };
+</script>
+</body>
+</html>
