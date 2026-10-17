@@ -42,6 +42,7 @@
 <label for="texto">Diálogo</label>
 <textarea id="texto" placeholder="男：你好，请问现在几点？&#10;女：现在三点半。&#10;男：谢谢！"></textarea>
 <div id="resumen"></div>
+<details id="prev" style="display:none;margin-top:6px"><summary style="cursor:pointer;font-size:13px;opacity:.75">Ver exactamente lo que se leerá</summary><div id="prevList"></div></details>
 
 <label for="archivo">…o carga un archivo .txt</label>
 <input type="file" id="archivo" accept=".txt">
@@ -70,6 +71,20 @@
   <div>
     <label for="nombre">Nombre del archivo</label>
     <input type="text" id="nombre" value="dialogo">
+  </div>
+</div>
+
+<div class="row">
+  <div>
+    <label for="vel">Velocidad del habla</label>
+    <select id="vel">
+      <option value="1">Normal (1×)</option>
+      <option value="0.9">0,9×</option>
+      <option value="0.85" selected>0,85× · recomendada para estudiar</option>
+      <option value="0.8">0,8×</option>
+      <option value="0.75">0,75×</option>
+      <option value="0.7">0,7×</option>
+    </select>
   </div>
 </div>
 
@@ -171,30 +186,64 @@ function optionsFor(p, voice) {
     case "elevenlabs": return { provider: "elevenlabs", model: "eleven_multilingual_v2", voice };
     case "gemini":     return { provider: "gemini", voice, language: "zh-CN" };
     case "openai":     return { provider: "openai", model: "gpt-4o-mini-tts", voice,
-                                instructions: "Habla en chino mandarín estándar con acento de Pekín, tono natural, tonos claros y bien marcados, ritmo pausado, como en una conversación real." };
+                                instructions: "Habla en chino mandarín estándar con acento de Pekín, tono natural, tonos claros y bien marcados, ritmo lento y pausado, claro, como en una conversación real." };
     case "aws-polly":  return { provider: "aws-polly", voice: voice || "Zhiyu", engine: "neural", language: "cmn-CN" };
   }
 }
 
 /* ---------- Análisis del diálogo ---------- */
-const TAG = /^\s*[\[【(（]?\s*(男|女)\s*([0-9０-９]{0,2})\s*[\]】)）]?\s*[:：]?\s*/;
+// Una marca es válida si lleva dos puntos, va entre corchetes, o está al inicio de línea seguida de espacio.
+// Así «女儿…» o «男朋友…» no se confunden con un personaje. Acepta 男声/男士/女士 y numeración previa («1. 男：»).
+const TAGRE = /([\[【(（]?)\s*(男|女)(?:声|士)?\s*([0-9０-９]{0,2})\s*([\]】)）]?)(\s*[:：])?(\s*)/y;
+function tagAt(s, i, lineStart) {
+  TAGRE.lastIndex = i;
+  const m = TAGRE.exec(s); if (!m) return null;
+  const [all, open, g, num, close, colon, sp] = m;
+  if (!!open !== !!close) return null;
+  if (!((open && close) || colon || (lineStart && (sp || i + all.length >= s.length)))) return null;
+  const id = num.replace(/[０-９]/g, c => String.fromCharCode(c.charCodeAt(0) - 0xFEE0));
+  return { len: all.length, key: g + id, g: g === "男" ? "m" : "f" };
+}
+function splitLine(line) {            // [{tag|null, text}] — admite varias marcas en la misma línea
+  let i = 0; while (i < line.length && /\s/.test(line[i])) i++;
+  const nm = line.slice(i).match(/^\d{1,3}\s*[.．、)）:：]\s*/);
+  if (nm && tagAt(line, i + nm[0].length, true)) i += nm[0].length;
+  const t0 = tagAt(line, i, true);
+  let cur = t0 ? { tag: t0, from: i + t0.len } : { tag: null, from: 0 };
+  const out = [];
+  for (let j = Math.max(cur.from, 1); j < line.length; j++) {
+    if (!/[\s。！？!?….,，、；;”"」)）]/.test(line[j - 1])) continue;   // dentro de la línea, solo tras puntuación o espacio
+    const t = tagAt(line, j, false);
+    if (!t) continue;
+    out.push({ tag: cur.tag, text: line.slice(cur.from, j) });
+    cur = { tag: t, from: j + t.len }; j = cur.from - 1;
+  }
+  out.push({ tag: cur.tag, text: line.slice(cur.from) });
+  return out;
+}
 function parseDialogue(text) {
   const turns = [], speakers = [], warnings = [];
+  let pending = null;                  // marca que estaba sola en su línea: el texto llega en la siguiente
+  const add = (tag, body) => {
+    if (!speakers.some(s => s.key === tag.key)) speakers.push({ key: tag.key, g: tag.g });
+    turns.push({ spk: tag.key, text: body });
+  };
   text.split(/\r?\n/).forEach((line, n) => {
     if (!line.trim()) return;
-    const m = line.match(TAG);
-    if (m) {
-      const id = m[2].replace(/[０-９]/g, c => String.fromCharCode(c.charCodeAt(0) - 0xFEE0));
-      const key = m[1] + id, body = line.slice(m[0].length).trim();
-      if (!body) { warnings.push(`Línea ${n + 1}: «${key}» sin texto, se ignora.`); return; }
-      if (!speakers.some(s => s.key === key)) speakers.push({ key, g: m[1] === "男" ? "m" : "f" });
-      turns.push({ spk: key, text: body });
-    } else if (turns.length) {
-      turns[turns.length - 1].text += " " + line.trim();
-    } else {
-      warnings.push(`Línea ${n + 1}: aparece antes de la primera marca 男/女, se ignora.`);
-    }
+    splitLine(line).forEach(seg => {
+      const body = seg.text.replace(/^[\s:：]+/, "").trim();
+      if (seg.tag) {
+        if (pending) warnings.push(`Línea ${n + 1}: «${pending.key}» sin texto, se ignora.`);
+        pending = null;
+        if (body) add(seg.tag, body); else pending = seg.tag;
+      } else if (body) {
+        if (pending) { add(pending, body); pending = null; }
+        else if (turns.length) turns[turns.length - 1].text += " " + body;
+        else warnings.push(`Línea ${n + 1}: aparece antes de la primera marca 男/女, se ignora.`);
+      }
+    });
   });
+  if (pending) warnings.push(`«${pending.key}» al final sin texto, se ignora.`);
   return { turns, speakers, warnings };
 }
 
@@ -227,6 +276,9 @@ function renderSpeakers() {
     pv.disabled = sel.disabled; pv.onclick = () => previewVoice(sel.value, pv);
     row.append(b, sel, pv); box.appendChild(row);
   });
+  const pl = $("prevList"); pl.innerHTML = "";
+  turns.forEach((t, i) => { const d = document.createElement("div"); d.style.cssText = "font-size:15px;margin-top:4px"; d.textContent = `${i + 1}. [${t.spk}] ${t.text}`; pl.appendChild(d); });
+  $("prev").style.display = turns.length ? "block" : "none";
   const names = speakers.map(s => s.key).join(", ");
   $("resumen").textContent = turns.length
     ? `${turns.length} intervenciones · personajes: ${names}` + (warnings.length ? " · " + warnings.join(" ") : "")
@@ -238,7 +290,7 @@ async function previewVoice(voice, btn) {
   btn.disabled = true;
   try {
     const audio = await puter.ai.txt2speech("你好，很高兴认识你。", optionsFor($("proveedor").value, voice));
-    if (audio) audio.play();
+    if (audio) { audio.playbackRate = parseFloat($("vel").value) || 1; audio.play(); }
   } catch (e) { log("✗ Error en la vista previa: " + errText(e), true); }
   btn.disabled = false;
 }
@@ -302,6 +354,34 @@ function levelize(f) {            // iguala el volumen entre voces (RMS objetivo
   for (let i = 0; i < f.length; i++) out[i] = f[i] * g;
   return out;
 }
+function stretch(x, sr, speed) {          // speed < 1 = más lento, sin cambiar el tono (WSOLA)
+  if (Math.abs(speed - 1) < 0.01 || x.length < 4000) return x;
+  const N = Math.round(sr * 0.03) & ~1, Hs = N / 2, Ha = Hs * speed, tol = Math.round(sr * 0.012);
+  const lead = tol + Hs, xp = new Float32Array(lead + x.length + 2 * N + 2 * tol);
+  xp.set(x, lead);
+  const win = new Float32Array(N);
+  for (let i = 0; i < N; i++) win[i] = 0.5 - 0.5 * Math.cos(2 * Math.PI * i / N);
+  const out = new Float32Array(Math.ceil((xp.length / Ha) * Hs) + N);
+  let prev = 0, k = 0, last = 0;
+  for (; ; k++) {
+    const nominal = tol + Math.round(k * Ha);
+    if (nominal + tol + N + Hs > xp.length) break;
+    let best = nominal;
+    if (k > 0) {
+      const target = prev + Hs; let bc = -Infinity;
+      for (let s = nominal - tol; s <= nominal + tol; s += 2) {
+        let c = 0, e = 1e-9;
+        for (let n = 0; n < N; n += 4) { const v = xp[s + n]; c += v * xp[target + n]; e += v * v; }
+        c /= Math.sqrt(e);
+        if (c > bc) { bc = c; best = s; }
+      }
+    }
+    const o = k * Hs;
+    for (let n = 0; n < N; n++) out[o + n] += xp[best + n] * win[n];
+    prev = best; last = o + N;
+  }
+  return out.subarray(0, last);
+}
 function resample(f, from, to) {
   if (from === to) return f;
   const n = Math.round(f.length * to / from), out = new Float32Array(n), k = from / to;
@@ -322,13 +402,13 @@ function wavBlob(pcm, sr) {
   return new Blob([buf], { type: "audio/wav" });
 }
 
-async function buildAudio(blobs, pauseSec) {
+async function buildAudio(blobs, pauseSec, speed) {
   const AC = window.AudioContext || window.webkitAudioContext;
   let ctx; try { ctx = new AC({ sampleRate: 44100 }); } catch (e) { ctx = new AC(); }
   const sr0 = ctx.sampleRate, parts = [];
   for (const b of blobs) {
     const ab = await ctx.decodeAudioData(await b.arrayBuffer());
-    parts.push(levelize(toMono(ab)));
+    parts.push(levelize(stretch(toMono(ab), sr0, speed)));
   }
   ctx.close && ctx.close();
   const gap = Math.round(pauseSec * sr0);
@@ -408,9 +488,9 @@ $("btnStart").onclick = async () => {
   if (stopFlag || failed) {
     log(stopFlag ? "Detenido. No se ha generado el archivo final." : `Hubo ${failed} intervención(es) con error: no se genera el archivo. Vuelve a pulsar «Generar»: solo se repetirán las que faltan.`, true);
   } else {
-    log("Uniendo las voces y codificando el archivo…");
+    log("Ajustando velocidad, uniendo las voces y codificando el archivo…");
     try {
-      const { blob, ext } = await buildAudio(results, pause);
+      const { blob, ext } = await buildAudio(results, pause, parseFloat($("vel").value) || 1);
       if (lastUrl) URL.revokeObjectURL(lastUrl);
       lastUrl = URL.createObjectURL(blob);
       $("player").src = lastUrl;
