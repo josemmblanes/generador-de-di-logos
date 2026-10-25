@@ -354,6 +354,14 @@ const QUOTA_RE = /quota|insufficient|balance|limit|credit|429|payment|funds/i;
 function errText(e) {
   return (e && (e.message || e.error?.message || e.error || (typeof e === "string" ? e : JSON.stringify(e)))) || "error desconocido";
 }
+function chunkText(t, max = 60) {        // turnos largos (narraciones) -> fragmentos por frases, para no saturar el sintetizador
+  if ([...t].length <= 80) return [t];
+  const sents = t.match(/[^。！？!?；;…]+[。！？!?；;…]*[”"’』」）)]*/g) || [t], out = [];
+  let cur = "";
+  for (const s of sents) { if (cur && [...cur].length + [...s].length > max) { out.push(cur); cur = s; } else cur += s; }
+  if (cur) out.push(cur);
+  return out.map(x => x.trim()).filter(Boolean);
+}
 const cache = new Map();   // "proveedor|voz|texto" -> blob
 async function synth(text, p, voice) {
   const audio = await puter.ai.txt2speech(text, optionsFor(p, voice));
@@ -483,6 +491,7 @@ $("btnStart").onclick = async () => {
   if (running) return;
   const { turns, speakers } = parseDialogue($("texto").value);
   if (!turns.length) return log("No hay intervenciones. Empieza cada línea con 男 o 女.", true);
+  const units = turns.flatMap(t => chunkText(t.text).map(c => ({ spk: t.spk, text: c })));   // lo que se sintetiza de verdad
   const voiceOf = {};
   for (const sp of speakers) {
     const sel = [...$("speakers").querySelectorAll("select")].find(s => s.dataset.key === sp.key);
@@ -494,19 +503,19 @@ $("btnStart").onclick = async () => {
   const p = $("proveedor").value, pause = Math.max(0, parseFloat($("pausa").value) || 0);
   running = true; stopFlag = false;
   $("btnStart").disabled = true; $("btnStop").disabled = false; $("result").style.display = "none";
-  const results = new Array(turns.length);
+  const results = new Array(units.length);
   let done = 0, failed = 0, idx = 0;
   const update = () => {
-    $("barFill").style.width = (100 * (done + failed) / turns.length) + "%";
-    $("count").textContent = `${done} generadas · ${failed} con error · ${turns.length} intervenciones`;
+    $("barFill").style.width = (100 * (done + failed) / units.length) + "%";
+    $("count").textContent = `${done} generadas · ${failed} con error · ${units.length} ${units.length === turns.length ? "intervenciones" : "fragmentos"}`;
   };
   update();
 
   async function worker() {
     while (!stopFlag) {
       const i = idx++;
-      if (i >= turns.length) return;
-      const it = turns[i], key = `${p}|${voiceOf[it.spk]}|${it.text}`;
+      if (i >= units.length) return;
+      const it = units[i], key = `${p}|${voiceOf[it.spk]}|${it.text}`;
       if (cache.has(key)) { results[i] = cache.get(key); done++; update(); continue; }
       let ok = false, lastErr = "";
       for (let attempt = 1; attempt <= 3 && !stopFlag; attempt++) {
@@ -519,7 +528,7 @@ $("btnStart").onclick = async () => {
           await sleep(800 * attempt);
         }
       }
-      if (ok) { done++; log(`✓ ${i + 1}/${turns.length} ${it.spk}: ${it.text.slice(0, 24)}${it.text.length > 24 ? "…" : ""}`); }
+      if (ok) { done++; log(`✓ ${i + 1}/${units.length} ${it.spk}: ${it.text.slice(0, 24)}${it.text.length > 24 ? "…" : ""}`); }
       else { failed++; if (!stopFlag) log(`✗ ${i + 1} (${it.spk}) — ${lastErr}`, true); }
       update();
       await sleep(250);
@@ -540,7 +549,7 @@ $("btnStart").onclick = async () => {
       $("dl").textContent = `⬇ Descargar ${safeName($("nombre").value)}.${ext} (${(blob.size / 1024 / 1024).toFixed(2)} MB)`;
       $("result").style.display = "block";
       const sp = parseFloat($("vel").value) || 1, allZh = turns.map(t => t.text).join(""), hz = (allZh.match(HANZI_G) || []).length;
-      const spoken = dur - pause * (turns.length - 1);
+      const spoken = dur - pause * (units.length - 1);
       if (spoken > 8 && hz > 40) { try { localStorage.setItem("cps_" + p, (hz / (spoken * sp)).toFixed(2)); } catch (e) {} }   // calibra la estimación de duración
       $("durInfo").textContent = "Duración real: " + fmtDur(dur) + (narTarget && narTarget.text === $("texto").value.trim() ? " (objetivo: " + fmtDur(narTarget.secs) + ")" : "");
       log("Listo: " + safeName($("nombre").value) + "." + ext);
@@ -627,7 +636,7 @@ function buildPrompt(n, mode, bank, tema, fix, o) {
       `Crea una narración NUEVA, coherente y con sentido, que fluya como un texto continuo (introducción, desarrollo y cierre), combinando frases, estructuras y expresiones de VARIOS textos del banco. Puedes reutilizar frases tal cual o adaptarlas (cambiar objetos, personas, horas, números…), siempre que el resultado tenga sentido.`,
       vocabRule,
       `Longitud: unos ${o.chars} caracteres chinos en total (entre ${lo} y ${hi}); leída en voz alta debe durar unos ${fmtDur(o.secs)} (min:s). Llegar a esa longitud es obligatorio: si te quedas sin ideas, añade detalles, ejemplos, hábitos, opiniones o repeticiones naturales, siempre con el vocabulario permitido.`,
-      `Habla un solo personaje. Cada línea empieza por ${o.keys[0]}： y contiene 1–3 frases (unos 80 caracteres como máximo); cambia de línea en cada pausa natural. Chino natural, SIN espacios entre palabras y sin pinyin.`);
+      `Habla un solo personaje. Escribe la narración como UN TEXTO CONTINUO, con la puntuación china normal: «。» al cerrar una frase y «，» o «；» dentro de ella según corresponda. NO pongas etiquetas de personaje (nada de 男： ni 女：), ni listas, ni un salto de línea por frase (como mucho, separa párrafos con una línea en blanco). Chino natural, SIN espacios entre palabras y sin pinyin.`);
   } else {
     const cnt = o.count ? `EXACTAMENTE ${o.count} intervenciones` : `entre ${r.t[0]} y ${r.t[1]} intervenciones`, h = o.h || r.h;
     rules.push(
@@ -642,7 +651,9 @@ function buildPrompt(n, mode, bank, tema, fix, o) {
   L.push(``, `REGLAS`, ...rules.map((x, i) => `${i + 1}. ${x}`));
   L.push(``, `LISTA DE VOCABULARIO PERMITIDO (${mode === "solo" ? "solo nivel " + n : lvTxt(n)}):`, pool.words.join(" "), ``);
   if (fix) L.push(`CORRECCIÓN NECESARIA. Tu intento anterior fue:`, fix.prev, `Problemas:`, ...fix.issues.map(s => "- " + s), `Escribe una versión nueva que los resuelva todos.`, ``);
-  L.push(`Responde SOLO con este formato, sin nada más:`, `CHINO:`, `${o.keys[0]}：…`, `${nar ? o.keys[0] : o.keys[1]}：…`, `ESPAÑOL:`, `(traducción al español, una línea por cada línea del chino)`);
+  L.push(`Responde SOLO con este formato, sin nada más:`, `CHINO:`,
+    ...(nar ? [`(la narración en chino, como texto continuo)`, `ESPAÑOL:`, `(traducción al español, también como texto continuo)`]
+            : [`${o.keys[0]}：…`, `${o.keys[1]}：…`, `ESPAÑOL:`, `(traducción al español, una línea por cada línea del chino)`]));
   return L.join("\n");
 }
 
@@ -658,11 +669,20 @@ async function askAI(prompt) {
   const model = $("modelo").value.trim();
   return aiText(await puter.ai.chat(prompt, model ? { model } : undefined));
 }
-function parseAI(raw) {
+function parseAI(raw, o) {
   const txt = String(raw).replace(/```[a-zA-Z]*/g, "").replace(/\*\*/g, "");
   const iz = txt.search(/CHINO\s*[:：]/i), ie = txt.search(/ESPA[ÑN]OL\s*[:：]/i);
   const zhRaw = (iz >= 0 ? txt.slice(iz, ie > iz ? ie : undefined) : (ie >= 0 ? txt.slice(0, ie) : txt)).replace(/^\s*CHINO\s*[:：]\s*/i, "");
   const es = ie >= 0 ? txt.slice(ie).replace(/^\s*ESPA[ÑN]OL\s*[:：]\s*/i, "").trim() : "";
+  if (o && o.kind === "nar") {            // narración: texto continuo, con una única marca de voz al principio
+    const TAG = /^\s*(?:[\[【(（]\s*[男女]\d?\s*[\]】)）]\s*[:：]?|[男女]\d?\s*[:：])\s*/;
+    const ls = zhRaw.split(/\r?\n/).map(l => l.replace(TAG, "").replace(/\s+/g, "")).filter(Boolean);
+    const body = ls.map((l, i) => /[。！？；，、…!?;,.]$/.test(l) ? l : l + (i === ls.length - 1 ? "。" : "，")).join("")
+      .replace(/,/g, "，").replace(/;/g, "；").replace(/\?/g, "？").replace(/!/g, "！").replace(/:/g, "：").replace(/(?<!\d)\.(?!\d)/g, "。");
+    const esC = es.split(/\r?\n/).map(l => l.replace(/^\s*(Narrador|Narradora|Hombre|Mujer)\s*[:：]\s*/i, "").trim()).filter(Boolean)
+      .map((l, i, a) => /[.!?;:,…]["”»)]?$/.test(l) ? l : l + (i === a.length - 1 ? "." : ",")).join(" ");
+    return { zh: body ? `${o.keys[0]}：${body}` : "", es: esC };
+  }
   const zh = parseDialogue(zhRaw).turns.map(t => `${t.spk}：${t.text.replace(/\s+/g, "")}`).join("\n");   // el chino no lleva espacios
   return { zh, es };
 }
@@ -770,7 +790,7 @@ $("btnCrear").onclick = async () => {
       info.textContent = nar
         ? `Escribiendo una narración de nivel ${n} (~${o.chars} caracteres, ≈ ${fmtDur(o.secs)})… (intento ${a}/3)`
         : `Creando un diálogo de nivel ${n} mezclando ${bank.length} textos del nivel… (intento ${a}/3)`;
-      const p = parseAI(await askAI(buildPrompt(n, mode, bank, tema, fix, o)));
+      const p = parseAI(await askAI(buildPrompt(n, mode, bank, tema, fix, o)), o);
       const c = p.zh ? checkDialogue(p.zh, n, mode, o) : { turns: 0, nh: 0, extra: [], reused: 0, issues: ["la respuesta no tenía el formato pedido (CHINO: / ESPAÑOL:)"] };
       const res = { ...c, ...p, score: c.extra.length * 10 + c.issues.length };
       if (!best || res.score < best.score) best = res;
@@ -784,11 +804,12 @@ $("btnCrear").onclick = async () => {
     $("crearTradTxt").textContent = best.es || "(la IA no devolvió traducción)";
     $("crearTrad").style.display = "block";
     const ok = !best.issues.length, voc = mode === "solo" ? "solo nivel " + n : lvTxt(n);
-    const estSec = nar ? Math.round(best.nh / (cpsFor($("proveedor").value) * (parseFloat($("vel").value) || 1)) + (parseFloat($("pausa").value) || 0) * (best.turns - 1)) : 0;
+    const nch = nar ? parseDialogue(best.zh).turns.reduce((a, t) => a + chunkText(t.text).length, 0) : 0;
+    const estSec = nar ? Math.round(best.nh / (cpsFor($("proveedor").value) * (parseFloat($("vel").value) || 1)) + (parseFloat($("pausa").value) || 0) * (nch - 1)) : 0;
     info.className = ok ? "" : "err";
     info.textContent = ok
       ? (nar
-        ? `✓ Nivel ${n} · narración de ${best.turns} líneas · ${best.nh} caracteres · duración estimada ≈ ${fmtDur(estSec)} (objetivo ${fmtDur(o.secs)}; la cifra real aparece al generar el audio) · vocabulario de tus diálogos (${voc}). Elige la voz y pulsa «Generar diálogo».`
+        ? `✓ Nivel ${n} · narración de ${best.nh} caracteres (se leerá en ${nch} fragmentos) · duración estimada ≈ ${fmtDur(estSec)} (objetivo ${fmtDur(o.secs)}; la cifra real aparece al generar el audio) · vocabulario de tus diálogos (${voc}). Elige la voz y pulsa «Generar diálogo».`
         : `✓ Nivel ${n} · ${best.turns} intervenciones · ${best.nh} caracteres · todo el vocabulario sale de tus diálogos (${voc}) · ${best.reused} de ${best.turns} frases son literales de tus diálogos y el resto están adaptadas. Ya está en el cuadro de arriba: elige voces y pulsa «Generar diálogo», o crea otro.`)
       : `⚠ Resultado con avisos (revísalo o crea otro): ${best.issues.join("; ")}.`;
   } catch (e) {
